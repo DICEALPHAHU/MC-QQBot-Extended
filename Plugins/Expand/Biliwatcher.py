@@ -319,26 +319,34 @@ async def get_up_nickname(uid: str) -> str:
                     logger.error(f"获取UP主昵称失败 - UID:{uid} 非JSON响应：{await response.text()}")
                     return "未知UP主"
 
-                # 校验返回体（按官方文档结构）
-                if result.get("code") != 0 or "data" not in result:
+                # ========== 新增：兼容两种返回格式 ==========
+                up_name = "未知UP主"
+                # 格式1：官方文档格式（code=0 + data）
+                if result.get("code") == 0 and "data" in result:
+                    up_name = result["data"].get("name", "").strip() or up_name
+                # 格式2：裸数据格式（直接返回用户信息，无code/data）
+                elif result.get("mid") == int(uid) and result.get("name"):
+                    up_name = result.get("name", "").strip() or up_name
+                # 格式3：其他异常情况
+                else:
                     err_msg = result.get("message", "返回数据结构异常")
                     logger.warning(f"获取UP主昵称失败 - UID:{uid} 错误：{err_msg}")
                     return "未知UP主"
+                # ========== 新增结束 ==========
 
-                # 提取昵称，兜底空值
-                up_name = result["data"].get("name", "").strip() or "未知UP主"
                 logger.debug(f"成功获取UP主昵称 - UID:{uid} 昵称:{up_name}")
                 return up_name
 
     except aiohttp.ClientError as e:
         logger.error(f"获取UP主昵称失败 - UID:{uid} 网络错误：{str(e)}")
+        return "未知UP主"
     except asyncio.TimeoutError:
         logger.error(f"获取UP主昵称失败 - UID:{uid} 请求超时")
+        return "未知UP主"
     except Exception as e:
         logger.error(f"获取UP主昵称失败 - UID:{uid} 未知异常：{str(e)}", exc_info=True)
+        return "未知UP主"
 
-    # 所有异常最终兜底
-    return "未知UP主"
 
 # 6. 视频快照生成
 async def get_video_frame_by_VSDU_async(video_url: str) -> Optional[Path]:
@@ -439,51 +447,86 @@ async def get_video_frame_by_VSDU_async(video_url: str) -> Optional[Path]:
             logger.debug(f"临时视频文件已清理：{video_path}")
 
 # 7. 推送新视频到指定群（加锁防重复+异步优化）
-async def push_new_video(video_data: Dict[str, Any]):
-    """推送新视频，加锁防止重复推送"""
+async def push_new_video(video_data: Dict[str, Any], max_retry: int = 3, retry_interval: int = 10):
+    """
+    推送新视频，加锁防止重复推送，失败自动重试3次（间隔10秒）
+    :param video_data: 视频数据字典
+    :param max_retry: 最大重试次数（默认3次）
+    :param retry_interval: 重试间隔（默认10秒）
+    """
     async with PUSH_LOCK:
-        try:
-            bvid = video_data.get("bvid", "")
-            title = video_data.get("title", "未知标题")
-            video_url = f"https://www.bilibili.com/video/{bvid}/"
+        bvid = video_data.get("bvid", "")
+        title = video_data.get("title", "未知标题")
+        video_url = f"https://www.bilibili.com/video/{bvid}/"
+        
+        logger.info(f"开始推送新视频：{title} ({bvid})")
+        
+        # 1. 先获取UP主昵称
+        up_nickname = await get_up_nickname(BILI_UP_UID)
+        
+        # 2. 异步生成快照
+        frame_path = await get_video_frame_by_VSDU_async(video_url)
+        
+        # 3. 组装推送消息
+        msg = Message()
+        msg += MessageSegment.text(f"订阅的UP主【{up_nickname}】动态更新啦！\n")
+        msg += MessageSegment.text(f"标题：{title}\n")
+        if frame_path and frame_path.exists():
+            msg += MessageSegment.image(f"file:///{frame_path.absolute()}")
+            msg += MessageSegment.text("\n")
+        msg += MessageSegment.text(f"链接：{video_url}")
+        
+        # 4. 带重试的推送逻辑
+        retry_count = 0
+        push_success = False
+        
+        while retry_count < max_retry and not push_success:
+            try:
+                bots = get_bots()
+                if not bots:
+                    raise RuntimeError("暂无可用的Bot连接，请检查Bot是否已上线")
+                
+                bot = list(bots.values())[0]  # 取第一个可用的Bot
+                push_tasks = []
+                
+                for group_id in MESSAGE_GROUPS:
+                    task = asyncio.create_task(_send_to_group(bot, group_id, msg, title, bvid))
+                    push_tasks.append(task)
+                
+                # 等待所有推送完成
+                results = await asyncio.gather(*push_tasks, return_exceptions=True)
+                
+                # 检查推送结果（只要有一个群推送成功，就判定为整体成功）
+                failed_groups = []
+                for idx, result in enumerate(results):
+                    group_id = MESSAGE_GROUPS[idx]
+                    if isinstance(result, Exception):
+                        failed_groups.append((group_id, str(result)))
+                    else:
+                        push_success = True
+                
+                if failed_groups:
+                    logger.warning(f"部分群推送失败（重试{retry_count+1}/{max_retry}）：{failed_groups}")
+                    retry_count += 1
+                    if retry_count < max_retry:
+                        logger.info(f"{retry_interval}秒后进行第{retry_count+1}次重试...")
+                        await asyncio.sleep(retry_interval)
+                else:
+                    push_success = True
             
-            logger.info(f"开始推送新视频：{title} ({bvid})")
-            
-            # 1. 先获取UP主昵称（关键：补上这行，定义up_nickname）
-            up_nickname = await get_up_nickname(BILI_UP_UID)
-            
-            # 2. 异步生成快照（非阻塞）
-            frame_path = await get_video_frame_by_VSDU_async(video_url)
-            
-            # 3. 组装推送消息（修改文案）
-            msg = Message()
-            # 这里用定义好的up_nickname，不会再报未定义错误
-            msg += MessageSegment.text(f"订阅的UP主【{up_nickname}】动态更新啦！\n")
-            msg += MessageSegment.text(f"标题：{title}\n")
-            if frame_path and frame_path.exists():
-                msg += MessageSegment.image(f"file:///{frame_path.absolute()}")
-                msg += MessageSegment.text("\n")
-            msg += MessageSegment.text(f"链接：{video_url}")
-            
-            # 4. 异步推送至所有群
-            bots = get_bots()
-            if not bots:
-                logger.error("推送失败：暂无可用的Bot连接，请检查Bot是否已上线")
-                return
-            bot = list(bots.values())[0]  # 取第一个可用的Bot
-            push_tasks = []
-            
-            for group_id in MESSAGE_GROUPS:
-                task = asyncio.create_task(_send_to_group(bot, group_id, msg, title, bvid))
-                push_tasks.append(task)
-            
-            # 等待所有推送完成
-            await asyncio.gather(*push_tasks, return_exceptions=True)
-            
+            except Exception as e:
+                logger.error(f"推送失败（重试{retry_count+1}/{max_retry}）：{e}")
+                retry_count += 1
+                if retry_count < max_retry:
+                    logger.info(f"{retry_interval}秒后进行第{retry_count+1}次重试...")
+                    await asyncio.sleep(retry_interval)
+        
+        # 最终结果日志
+        if push_success:
             logger.success(f"新视频推送完成：{title} ({bvid})")
-            
-        except Exception as e:
-            logger.error(f"推送新视频失败：{e}")
+        else:
+            logger.error(f"新视频推送失败（已重试{max_retry}次）：{title} ({bvid})")
+            logger.info("将等待下一次监控周期再尝试推送")
 
 async def _send_to_group(bot, group_id: str, msg: Message, title: str, bvid: str):
     """内部函数：单独推送单个群，方便异步处理"""
@@ -740,4 +783,3 @@ async def shutdown():
     await clean_expired_temp_files()
     
     logger.success("B站UP监控插件已安全关闭")
-
